@@ -1,82 +1,102 @@
 
 const express = require("express");
-const bcrypt = require("bcryptjs");
 const session = require("express-session");
+const bcrypt = require("bcryptjs");
+const initSqlJs = require("sql.js");
 const path = require("path");
+const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Database setup
+let db;
+const dbPath = path.join(__dirname, "users.db");
+
+async function initializeDatabase() {
+    const SQL = await initSqlJs();
+
+    if (fs.existsSync(dbPath)) {
+        const fileBuffer = fs.readFileSync(dbPath);
+        db = new SQL.Database(fileBuffer);
+    } else {
+        db = new SQL.Database();
+    }
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    `);
+
+    saveDatabase();
+}
+
+function saveDatabase() {
+    const data = db.export();
+    fs.writeFileSync(dbPath, Buffer.from(data));
+}
 
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use(
-    session({
-        secret: process.env.SESSION_SECRET || "development-secret-change-this",
-        resave: false,
-        saveUninitialized: false,
-        cookie: {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === "production",
-            sameSite: "lax"
-        }
-    })
-);
+app.use(session({
+    secret: process.env.SESSION_SECRET || "change-this-secret-before-deployment",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax"
+    }
+}));
 
-// In-memory users for this demo application.
-// Data resets when the server restarts.
-const users = [];
-
-// Serve frontend files
 app.use(express.static(path.join(__dirname, "public")));
 
-// Register
+// Health check route
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        status: "OK",
+        message: "Login application is running",
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Register route
 app.post("/register", async (req, res) => {
     try {
         const { username, password } = req.body;
 
-        if (!username || !password) {
+        if (!username || !password || password.length < 8) {
             return res.status(400).json({
-                message: "Username and password are required"
+                message: "Username and password (minimum 8 characters) are required"
             });
         }
 
-        if (password.length < 8) {
-            return res.status(400).json({
-                message: "Password must contain at least 8 characters"
-            });
-        }
+        const hashedPassword = await bcrypt.hash(password, 12);
 
-        const existingUser = users.find(
-            user => user.username === username
+        db.run(
+            "INSERT INTO users (username, password) VALUES (?, ?)",
+            [username, hashedPassword]
         );
 
-        if (existingUser) {
-            return res.status(409).json({
-                message: "Username already exists"
-            });
-        }
+        saveDatabase();
 
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        users.push({
-            username,
-            password: hashedPassword
-        });
-
-        return res.status(201).json({
+        res.status(201).json({
             message: "Registration successful"
         });
 
     } catch (error) {
-        return res.status(500).json({
-            message: "Registration failed"
+        res.status(400).json({
+            message: "Registration failed. Username may already exist."
         });
     }
 });
 
-// Login
+// Login route
 app.post("/login", async (req, res) => {
     try {
         const { username, password } = req.body;
@@ -87,64 +107,64 @@ app.post("/login", async (req, res) => {
             });
         }
 
-        const user = users.find(
-            item => item.username === username
+        const result = db.exec(
+            "SELECT * FROM users WHERE username = ?",
+            [username]
         );
 
-        if (!user) {
+        if (!result.length || !result[0].values.length) {
             return res.status(401).json({
                 message: "Invalid username or password"
             });
         }
 
-        const passwordMatches = await bcrypt.compare(
+        const user = result[0].values[0];
+
+        const validPassword = await bcrypt.compare(
             password,
-            user.password
+            user[2]
         );
 
-        if (!passwordMatches) {
+        if (!validPassword) {
             return res.status(401).json({
                 message: "Invalid username or password"
             });
         }
 
         req.session.user = {
-            username: user.username
+            id: user[0],
+            username: user[1]
         };
 
-        return res.status(200).json({
-            message: "Login successful"
+        res.json({
+            message: "Login successful",
+            username: user[1]
         });
 
     } catch (error) {
-        return res.status(500).json({
+        res.status(500).json({
             message: "Login failed"
         });
     }
 });
 
-// Authentication middleware
-function authenticate(req, res, next) {
+// Dashboard route
+app.get("/dashboard", (req, res) => {
     if (!req.session.user) {
         return res.status(401).json({
-            message: "Unauthorized. Please login first."
+            message: "Unauthorized. Please login."
         });
     }
 
-    next();
-}
-
-// Dashboard
-app.get("/dashboard", authenticate, (req, res) => {
-    res.status(200).json({
-        message: "Welcome to dashboard",
-        username: req.session.user.username
+    res.json({
+        message: "Welcome to your dashboard",
+        user: req.session.user
     });
 });
 
-// Logout
+// Logout route
 app.post("/logout", (req, res) => {
-    req.session.destroy(error => {
+    req.session.destroy((error) => {
         if (error) {
             return res.status(500).json({
                 message: "Logout failed"
@@ -153,25 +173,31 @@ app.post("/logout", (req, res) => {
 
         res.clearCookie("connect.sid");
 
-        return res.status(200).json({
+        res.json({
             message: "Logout successful"
         });
     });
 });
 
-// Health check
-app.get("/health", (req, res) => {
-    res.status(200).json({
-        status: "OK"
-    });
-});
+// Start server
+async function startServer() {
+    try {
+        await initializeDatabase();
 
-// Start server only when running directly.
-// This allows Supertest to import the Express app.
+        app.listen(PORT, () => {
+            console.log(`Server running at http://localhost:${PORT}`);
+            console.log(`Health check: http://localhost:${PORT}/health`);
+        });
+
+    } catch (error) {
+        console.error("Database initialization failed:", error);
+        process.exit(1);
+    }
+}
+
 if (require.main === module) {
-    app.listen(PORT, () => {
-        console.log(`Server running at http://localhost:${PORT}`);
-    });
+    startServer();
 }
 
 module.exports = app;
+module.exports.initializeDatabase = initializeDatabase;
