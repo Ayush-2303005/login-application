@@ -2,133 +2,176 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const session = require("express-session");
-const initSqlJs = require("sql.js");
-const fs = require("fs");
 const path = require("path");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
+// Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use(session({
-    secret: process.env.SESSION_SECRET || "local-development-secret",
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        httpOnly: true,
-        sameSite: "lax"
-    }
-}));
+app.use(
+    session({
+        secret: process.env.SESSION_SECRET || "development-secret-change-this",
+        resave: false,
+        saveUninitialized: false,
+        cookie: {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === "production",
+            sameSite: "lax"
+        }
+    })
+);
 
+// In-memory users for this demo application.
+// Data resets when the server restarts.
+const users = [];
+
+// Serve frontend files
 app.use(express.static(path.join(__dirname, "public")));
 
-let db;
-
-function saveDatabase() {
-    const data = db.export();
-
-    fs.writeFileSync(
-        path.join(__dirname, "users.db"),
-        Buffer.from(data)
-    );
-}
-
-async function startApp() {
-
-    const SQL = await initSqlJs();
-
-    const dbPath = path.join(__dirname, "users.db");
-
-    if (fs.existsSync(dbPath)) {
-        db = new SQL.Database(
-            new Uint8Array(fs.readFileSync(dbPath))
-        );
-    } else {
-        db = new SQL.Database();
-    }
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
-        )
-    `);
-
-    saveDatabase();
-
-    app.post("/register", async (req, res) => {
-        try {
-            const { username, password } = req.body;
-
-            if (!username || !password || password.length < 8) {
-                return res.status(400).send("Invalid registration details");
-            }
-
-            const hash = await bcrypt.hash(password, 12);
-
-            db.run(
-                "INSERT INTO users (username, password) VALUES (?, ?)",
-                [username, hash]
-            );
-
-            saveDatabase();
-
-            res.status(201).send("Registration successful");
-
-        } catch (error) {
-            res.status(400).send("Registration failed");
-        }
-    });
-
-    app.post("/login", async (req, res) => {
+// Register
+app.post("/register", async (req, res) => {
+    try {
         const { username, password } = req.body;
 
-        const result = db.exec(
-            "SELECT id, password FROM users WHERE username = ?",
-            [username]
+        if (!username || !password) {
+            return res.status(400).json({
+                message: "Username and password are required"
+            });
+        }
+
+        if (password.length < 8) {
+            return res.status(400).json({
+                message: "Password must contain at least 8 characters"
+            });
+        }
+
+        const existingUser = users.find(
+            user => user.username === username
         );
 
-        if (!result.length || !result[0].values.length) {
-            return res.status(401).send("Invalid username or password");
+        if (existingUser) {
+            return res.status(409).json({
+                message: "Username already exists"
+            });
         }
 
-        const [id, hashedPassword] = result[0].values[0];
+        const hashedPassword = await bcrypt.hash(password, 10);
 
-        if (!(await bcrypt.compare(password, hashedPassword))) {
-            return res.status(401).send("Invalid username or password");
+        users.push({
+            username,
+            password: hashedPassword
+        });
+
+        return res.status(201).json({
+            message: "Registration successful"
+        });
+
+    } catch (error) {
+        return res.status(500).json({
+            message: "Registration failed"
+        });
+    }
+});
+
+// Login
+app.post("/login", async (req, res) => {
+    try {
+        const { username, password } = req.body;
+
+        if (!username || !password) {
+            return res.status(400).json({
+                message: "Username and password are required"
+            });
         }
 
-        req.session.userId = id;
+        const user = users.find(
+            item => item.username === username
+        );
 
-        res.send("Login successful");
+        if (!user) {
+            return res.status(401).json({
+                message: "Invalid username or password"
+            });
+        }
+
+        const passwordMatches = await bcrypt.compare(
+            password,
+            user.password
+        );
+
+        if (!passwordMatches) {
+            return res.status(401).json({
+                message: "Invalid username or password"
+            });
+        }
+
+        req.session.user = {
+            username: user.username
+        };
+
+        return res.status(200).json({
+            message: "Login successful"
+        });
+
+    } catch (error) {
+        return res.status(500).json({
+            message: "Login failed"
+        });
+    }
+});
+
+// Authentication middleware
+function authenticate(req, res, next) {
+    if (!req.session.user) {
+        return res.status(401).json({
+            message: "Unauthorized. Please login first."
+        });
+    }
+
+    next();
+}
+
+// Dashboard
+app.get("/dashboard", authenticate, (req, res) => {
+    res.status(200).json({
+        message: "Welcome to dashboard",
+        username: req.session.user.username
     });
+});
 
-    app.get("/dashboard", (req, res) => {
-        if (!req.session.userId) {
-            return res.status(401).send("Please login first");
+// Logout
+app.post("/logout", (req, res) => {
+    req.session.destroy(error => {
+        if (error) {
+            return res.status(500).json({
+                message: "Logout failed"
+            });
         }
 
-        res.send("Welcome to your dashboard!");
-    });
+        res.clearCookie("connect.sid");
 
-    app.post("/logout", (req, res) => {
-        req.session.destroy(() => {
-            res.send("Logged out successfully");
+        return res.status(200).json({
+            message: "Logout successful"
         });
     });
+});
 
-    app.listen(3000, () => {
-        console.log("Application running on port 3000");
+// Health check
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        status: "OK"
     });
-}
+});
 
+// Start server only when running directly.
+// This allows Supertest to import the Express app.
 if (require.main === module) {
-    startApp().catch(error => {
-        console.error("Application startup failed:", error);
-        process.exit(1);
+    app.listen(PORT, () => {
+        console.log(`Server running at http://localhost:${PORT}`);
     });
 }
 
-module.exports = { app };
+module.exports = app;
